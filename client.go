@@ -8,8 +8,12 @@ import (
 	"appengine/socket"
 )
 
-var lock = make(chan int, 1)
-var Conn net.Conn
+var (
+	lock         = make(chan int, 1)
+	requestLimit = 100
+	Conn         net.Conn
+	requestCount = 0
+)
 
 // The StatsdClient type defines the relevant properties of a StatsD connection.
 type StatsdClient struct {
@@ -26,14 +30,14 @@ type StatsdClient struct {
 func New(c appengine.Context, host string, port string) *StatsdClient {
 	client := StatsdClient{Host: host, Port: port}
 	if Conn == nil {
-		EstablishConnection(c, host, port)
+		client.EstablishConnection(c)
 	}
 	return &client
 }
 
 // Method to open udp connection, called by default client factory
-func EstablishConnection(c appengine.Context, host string, port string) {
-	connectionString := fmt.Sprintf("%s:%s", host, port)
+func (client *StatsdClient) EstablishConnection(c appengine.Context) {
+	connectionString := fmt.Sprintf("%s:%s", client.Host, client.Port)
 	var err error
 	Conn, err = socket.Dial(c, "udp", connectionString)
 	if err != nil {
@@ -112,10 +116,18 @@ func (client *StatsdClient) Decrement(c appengine.Context, stat string) {
 // Sends data to udp statsd daemon
 func (client *StatsdClient) Send(c appengine.Context, data map[string]string) {
 	for k, v := range data {
+		if requestCount == 100 {
+			client.EstablishConnection(c)
+		}
 		update_string := fmt.Sprintf("%s:%s", k, v)
 		_, err := fmt.Fprintf(Conn, update_string)
 		if err != nil {
-			c.Errorf("Error sending data")
+			client.EstablishConnection(c)
+			_, err := fmt.Fprintf(Conn, update_string)
+			if err != nil {
+				c.Errorf("Error sending data")
+			}
 		}
+		requestCount += 1
 	}
 }
