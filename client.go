@@ -9,12 +9,12 @@ import (
 )
 
 var lock = make(chan int, 1)
+var Conn net.Conn
 
 // The StatsdClient type defines the relevant properties of a StatsD connection.
 type StatsdClient struct {
 	Host string
-	Port int
-	conn net.Conn
+	Port string
 }
 
 // Factory method to initialize udp connection
@@ -23,25 +23,27 @@ type StatsdClient struct {
 //
 //     import "statsd"
 //     client := statsd.New('localhost', 8125)
-func New(c appengine.Context, host string, port int) *StatsdClient {
+func New(c appengine.Context, host string, port string) *StatsdClient {
 	client := StatsdClient{Host: host, Port: port}
-	client.EstablishConnection(c)
+	if Conn == nil {
+		EstablishConnection(c, host, port)
+	}
 	return &client
 }
 
 // Method to open udp connection, called by default client factory
-func (client *StatsdClient) EstablishConnection(c appengine.Context) {
-	connectionString := fmt.Sprintf("%s:%d", client.Host, client.Port)
-	conn, err := socket.Dial(c, "udp", connectionString)
+func EstablishConnection(c appengine.Context, host string, port string) {
+	connectionString := fmt.Sprintf("%s:%s", host, port)
+	var err error
+	Conn, err = socket.Dial(c, "udp", connectionString)
 	if err != nil {
 		c.Errorf("Connection Error")
 	}
-	client.conn = conn
 }
 
 // Method to close udp connection
 func (client *StatsdClient) Close() {
-	client.conn.Close()
+	Conn.Close()
 }
 
 // Log timing information (in milliseconds) without sampling
@@ -111,7 +113,7 @@ func (client *StatsdClient) Decrement(c appengine.Context, stat string) {
 func (client *StatsdClient) Send(c appengine.Context, data map[string]string) {
 	for k, v := range data {
 		update_string := fmt.Sprintf("%s:%s", k, v)
-		_, err := fmt.Fprintf(client.conn, update_string)
+		_, err := fmt.Fprintf(Conn, update_string)
 		if err != nil {
 			c.Errorf("Error sending data")
 		}
