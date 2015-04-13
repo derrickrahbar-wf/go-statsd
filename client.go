@@ -11,14 +11,22 @@ import (
 var (
 	lock         = make(chan int, 1)
 	requestLimit = 100
-	Conn         net.Conn
 	requestCount = 0
+	bufferSize   = 512
+	Conn         net.Conn
 )
 
 // The StatsdClient type defines the relevant properties of a StatsD connection.
 type StatsdClient struct {
-	Host string
-	Port string
+	Host     string
+	Port     string
+	buffer   string
+	reqs     chan string
+	shutdown chan bool
+}
+
+func init() {
+	lock <- 1
 }
 
 // Factory method to initialize udp connection
@@ -28,10 +36,15 @@ type StatsdClient struct {
 //     import "statsd"
 //     client := statsd.New('localhost', 8125)
 func New(c appengine.Context, host string, port string) *StatsdClient {
-	client := StatsdClient{Host: host, Port: port}
+	client := StatsdClient{Host: host,
+		Port:     port,
+		reqs:     make(chan string),
+		shutdown: make(chan bool)}
+
 	if Conn == nil {
 		client.EstablishConnection(c)
 	}
+	go client.Send(c)
 	return &client
 }
 
@@ -47,6 +60,7 @@ func (client *StatsdClient) EstablishConnection(c appengine.Context) {
 
 // Method to close udp connection
 func (client *StatsdClient) Close() {
+	client.shutdown <- true
 	Conn.Close()
 }
 
@@ -65,10 +79,9 @@ func (client *StatsdClient) Close() {
 //     t2 := time.Now()
 //     duration := int64(t2.Sub(t1)/time.Millisecond)
 //     client.Timing("foo.time", duration)
-func (client *StatsdClient) Timing(c appengine.Context, stat string, time int64) {
-	updateString := fmt.Sprintf("%d|ms", time)
-	stats := map[string]string{stat: updateString}
-	client.Send(c, stats)
+func (client *StatsdClient) Timing(stat string, time int64) {
+	updateString := fmt.Sprintf("%s:%d|ms", stat, time)
+	client.reqs <- updateString
 }
 
 // Increments one stat counter without sampling
@@ -78,10 +91,9 @@ func (client *StatsdClient) Timing(c appengine.Context, stat string, time int64)
 //     import "statsd"
 //     client := statsd.New('localhost', 8125)
 //     client.Increment('foo.bar')
-func (client *StatsdClient) Increment(c appengine.Context, stat string) {
-	updateString := fmt.Sprintf("%d|c", 1)
-	stats := map[string]string{stat: updateString}
-	client.Send(c, stats)
+func (client *StatsdClient) Increment(stat string) {
+	updateString := fmt.Sprintf("%s:%d|c", stat, 1)
+	client.reqs <- updateString
 }
 
 // Decrements one stat counter without sampling
@@ -91,10 +103,9 @@ func (client *StatsdClient) Increment(c appengine.Context, stat string) {
 //     import "statsd"
 //     client := statsd.New('localhost', 8125)
 //     client.Decrement('foo.bar')
-func (client *StatsdClient) Decrement(c appengine.Context, stat string) {
-	updateString := fmt.Sprintf("%d|c", -1)
-	stats := map[string]string{stat: updateString}
-	client.Send(c, stats)
+func (client *StatsdClient) Decrement(stat string) {
+	updateString := fmt.Sprintf("%s:%d|c", stat, -1)
+	client.reqs <- updateString
 }
 
 // Arbitrarily updates a list of stats by a delta
@@ -113,21 +124,66 @@ func (client *StatsdClient) Decrement(c appengine.Context, stat string) {
 // 	lock <- 1
 // }
 
-// Sends data to udp statsd daemon
-func (client *StatsdClient) Send(c appengine.Context, data map[string]string) {
-	for k, v := range data {
-		if requestCount == 100 {
-			client.EstablishConnection(c)
-		}
-		update_string := fmt.Sprintf("%s:%s", k, v)
-		_, err := fmt.Fprintf(Conn, update_string)
+// Sends the data in client buffer to statsd. Since there is a shared
+// connection between all clients, this function is protected buy
+// a lock
+func (client *StatsdClient) flush(c appengine.Context) {
+	<-lock
+	data := client.buffer
+	if requestCount == 100 {
+		client.EstablishConnection(c)
+	}
+	_, err := fmt.Fprintf(Conn, data)
+	if err != nil {
+		client.EstablishConnection(c)
+		_, err := fmt.Fprintf(Conn, data)
 		if err != nil {
-			client.EstablishConnection(c)
-			_, err := fmt.Fprintf(Conn, update_string)
-			if err != nil {
-				c.Errorf("Error sending data")
-			}
+			c.Errorf("Error sending data")
 		}
-		requestCount += 1
+	}
+	client.buffer = ""
+	requestCount += 1
+	lock <- 1
+
+}
+
+// Sends data to udp statsd daemon
+func (client *StatsdClient) Send(c appengine.Context) {
+	for {
+		select {
+		case data := <-client.reqs:
+			newLine := data + "\n"
+			if len(client.buffer)+len(newLine) > bufferSize {
+				client.flush(c)
+			}
+			client.buffer += (newLine)
+			if len(client.buffer) >= bufferSize {
+				client.flush(c)
+			}
+
+		case <-client.shutdown:
+			if len(client.buffer) > 0 {
+				client.flush(c)
+			}
+			break
+		}
 	}
 }
+
+// func (client *StatsdClient) Send(c appengine.Context) {
+// 	for k, v := range data {
+// 		if requestCount == 100 {
+// 			client.EstablishConnection(c)
+// 		}
+// 		update_string := fmt.Sprintf("%s:%s", k, v)
+// 		_, err := fmt.Fprintf(Conn, update_string)
+// 		if err != nil {
+// 			client.EstablishConnection(c)
+// 			_, err := fmt.Fprintf(Conn, update_string)
+// 			if err != nil {
+// 				c.Errorf("Error sending data")
+// 			}
+// 		}
+// 		requestCount += 1
+// 	}
+// }
